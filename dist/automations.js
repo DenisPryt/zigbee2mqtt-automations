@@ -23,7 +23,6 @@
  */
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 /* eslint-disable @typescript-eslint/no-dynamic-delete */
-/* eslint-disable @typescript-eslint/no-empty-object-type */
 /* eslint-disable @typescript-eslint/no-require-imports */
 /* eslint-disable @typescript-eslint/ban-ts-comment */
 /* eslint-disable no-console */
@@ -75,6 +74,15 @@ var MessagePayload;
 (function (MessagePayload) {
     MessagePayload["EXECUTE"] = "execute";
 })(MessagePayload || (MessagePayload = {}));
+const isConfigEntityCondition = (condition) => {
+    return !!condition.entity;
+};
+const isConfigTimeCondition = (condition) => {
+    return (!!condition.after ||
+        !!condition.before ||
+        !!condition.between ||
+        !!condition.weekday);
+};
 class InternalLogger {
     debug(message, ...args) {
         console.log(`\x1b[46m\x1b[97m[Automations]\x1b[0m \x1b[38;5;247m${message}\x1b[0m`, ...args);
@@ -441,25 +449,19 @@ class AutomationsExtension {
      * @param to
      */
     checkTrigger(automation, configTrigger, update, from, to) {
-        let trigger;
-        let attribute;
-        let result;
-        let actions;
         // this.log.warning(`[Automations] Trigger check [${automation.name}] update: ${this.stringify(update)} from: ${this.stringify(from)} to: ${this.stringify(to)}`);
         if (configTrigger.action !== undefined) {
             if (!Object.prototype.hasOwnProperty.call(update, 'action')) {
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] no 'action' in update for #${configTrigger.entity}#`);
                 return null;
             }
-            trigger = configTrigger;
-            actions = toArray(trigger.action);
-            result = actions.includes(update.action);
+            const actions = toArray(configTrigger.action);
+            const result = actions.includes(update.action);
             this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger is ${result} for #${configTrigger.entity}# action(s): ${this.stringify(actions)}`);
             return result;
         }
         else if (configTrigger.attribute !== undefined) {
-            trigger = configTrigger;
-            attribute = trigger.attribute;
+            const attribute = configTrigger.attribute;
             if (!Object.prototype.hasOwnProperty.call(update, attribute) || !Object.prototype.hasOwnProperty.call(to, attribute)) {
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] no '${attribute}' published for #${configTrigger.entity}#`);
                 return null;
@@ -468,8 +470,8 @@ class AutomationsExtension {
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] no '${attribute}' change for #${configTrigger.entity}#`);
                 return null;
             }
-            if (typeof trigger.equal !== 'undefined' || typeof trigger.state !== 'undefined') {
-                const value = trigger.state !== undefined ? trigger.state : trigger.equal;
+            if (typeof configTrigger.equal !== 'undefined' || typeof configTrigger.state !== 'undefined') {
+                const value = configTrigger.state !== undefined ? configTrigger.state : configTrigger.equal;
                 if (to[attribute] !== value) {
                     this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' != ${value} for #${configTrigger.entity}#`);
                     return false;
@@ -480,44 +482,55 @@ class AutomationsExtension {
                 }
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger equal/state ${value} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
             }
-            if (typeof trigger.not_equal !== 'undefined') {
-                if (to[attribute] === trigger.not_equal) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' = ${trigger.not_equal} for #${configTrigger.entity}#`);
+            if (typeof configTrigger.not_equal !== 'undefined') {
+                if (to[attribute] === configTrigger.not_equal) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' = ${configTrigger.not_equal} for #${configTrigger.entity}#`);
                     return false;
                 }
-                if (from[attribute] !== trigger.not_equal) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already != ${trigger.not_equal} for #${configTrigger.entity}#`);
+                if (from[attribute] !== configTrigger.not_equal) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already != ${configTrigger.not_equal} for #${configTrigger.entity}#`);
                     return null;
                 }
-                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger not equal ${trigger.not_equal} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
+                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger not equal ${configTrigger.not_equal} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
             }
-            if (typeof trigger.above !== 'undefined') {
-                if (to[attribute] <= trigger.above) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' <= ${trigger.above} for #${configTrigger.entity}#`);
-                    return false;
-                }
-                if (from[attribute] > trigger.above) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already > ${trigger.above} for #${configTrigger.entity}#`);
+            if (typeof configTrigger.above !== 'undefined') {
+                const toAttr = Number(to[attribute]);
+                const fromAttr = Number(from[attribute]);
+                if (isNaN(toAttr) || isNaN(fromAttr)) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' is not a number for #${configTrigger.entity}#`);
                     return null;
                 }
-                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger above ${trigger.above} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
+                if (toAttr <= configTrigger.above) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' <= ${configTrigger.above} for #${configTrigger.entity}#`);
+                    return false;
+                }
+                if (fromAttr > configTrigger.above) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already > ${configTrigger.above} for #${configTrigger.entity}#`);
+                    return null;
+                }
+                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger above ${configTrigger.above} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
             }
-            if (typeof trigger.below !== 'undefined') {
-                if (to[attribute] >= trigger.below) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' >= ${trigger.below} for #${configTrigger.entity}#`);
-                    return false;
-                }
-                if (from[attribute] < trigger.below) {
-                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already < ${trigger.below} for #${configTrigger.entity}#`);
+            if (typeof configTrigger.below !== 'undefined') {
+                const toAttr = Number(to[attribute]);
+                const fromAttr = Number(from[attribute]);
+                if (isNaN(toAttr) || isNaN(fromAttr)) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' is not a number for #${configTrigger.entity}#`);
                     return null;
                 }
-                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger below ${trigger.below} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
+                if (toAttr >= configTrigger.below) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' >= ${configTrigger.below} for #${configTrigger.entity}#`);
+                    return false;
+                }
+                if (fromAttr < configTrigger.below) {
+                    this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' already < ${configTrigger.below} for #${configTrigger.entity}#`);
+                    return null;
+                }
+                this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger below ${configTrigger.below} is true for #${configTrigger.entity}# ${attribute} is ${to[attribute]} `);
             }
             return true;
         }
         else if (configTrigger.state !== undefined) {
-            trigger = configTrigger;
-            attribute = 'state';
+            const attribute = 'state';
             if (!Object.prototype.hasOwnProperty.call(update, attribute) || !Object.prototype.hasOwnProperty.call(to, attribute)) {
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] no '${attribute}' published for #${configTrigger.entity}#`);
                 return null;
@@ -526,11 +539,11 @@ class AutomationsExtension {
                 this.logger.debug(`[Automations] Trigger check [${automation.name}] no '${attribute}' change for #${configTrigger.entity}#`);
                 return null;
             }
-            if (to[attribute] !== trigger.state) {
-                this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' != ${trigger.state} for #${configTrigger.entity}#`);
+            if (to[attribute] !== configTrigger.state) {
+                this.logger.debug(`[Automations] Trigger check [${automation.name}] '${attribute}' != ${configTrigger.state} for #${configTrigger.entity}#`);
                 return null;
             }
-            this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger state ${trigger.state} is true for #${configTrigger.entity}# state is ${to[attribute]}`);
+            this.logger.debug(`[Automations] Trigger check [${automation.name}] trigger state ${configTrigger.state} is true for #${configTrigger.entity}# state is ${to[attribute]}`);
             return true;
         }
         return false;
@@ -538,13 +551,10 @@ class AutomationsExtension {
     checkCondition(automation, condition) {
         let timeResult = true;
         let eventResult = true;
-        if (condition.after ||
-            condition.before ||
-            condition.between ||
-            condition.weekday) {
+        if (isConfigTimeCondition(condition)) {
             timeResult = this.checkTimeCondition(automation, condition);
         }
-        if (condition.entity) {
+        if (isConfigEntityCondition(condition)) {
             eventResult = this.checkEntityCondition(automation, condition);
         }
         return timeResult && eventResult;
