@@ -122,7 +122,7 @@ interface ConfigTimeTrigger {
   elevation?: number;
 }
 
-interface ConfigEventTrigger {
+interface ConfigEventTriggerBase {
   entity: EntityId | EntityId[];
   for?: TriggerForType;
   action?: ConfigActionType | ConfigActionType[];
@@ -134,15 +134,15 @@ interface ConfigEventTrigger {
   below?: number;
 }
 
-interface ConfigActionTrigger extends ConfigEventTrigger {
+interface ConfigActionTrigger extends ConfigEventTriggerBase {
   action: ConfigActionType | ConfigActionType[];
 }
 
-interface ConfigStateTrigger extends ConfigEventTrigger {
+interface ConfigStateTrigger extends ConfigEventTriggerBase {
   state: ConfigStateType | ConfigStateType[];
 }
 
-interface ConfigAttributeTrigger extends ConfigEventTrigger {
+interface ConfigAttributeTrigger extends ConfigEventTriggerBase {
   attribute: ConfigAttributeType;
   equal?: ConfigAttributeValueType;
   not_equal?: ConfigAttributeValueType;
@@ -150,12 +150,14 @@ interface ConfigAttributeTrigger extends ConfigEventTrigger {
   below?: number;
 }
 
+type ConfigEventTrigger = ConfigActionTrigger | ConfigStateTrigger | ConfigAttributeTrigger;
+
 interface ConfigSequenceTrigger {
-  sequence: ConfigTrigger[];
+  sequence: ConfigEventTrigger[];
   max_delay: number;
 }
 
-type ConfigTrigger = StrictUnion<ConfigTimeTrigger | ConfigActionTrigger | ConfigStateTrigger | ConfigAttributeTrigger | ConfigSequenceTrigger>;
+type ConfigTrigger = StrictUnion<ConfigTimeTrigger | ConfigEventTrigger | ConfigSequenceTrigger>;
 
 type ConfigActionPayload = Record<ConfigAttributeType, ConfigPayloadType>;
 
@@ -234,18 +236,38 @@ type BaseAutomation = Named & {
 };
 
 // Internal event based automations
-type EventAutomation = BaseAutomation & {
+type EventAutomationEntity = BaseAutomation & {
   trigger: ConfigEventTrigger;
   condition: ConfigCondition[];
   action: ConfigAction[];
 };
 
+type EventAutomationSequence = EventAutomationEntity & {
+  execute_once?: undefined | false; // sequence automation cannot be executed once
+
+  triggerIndex: number;
+  sequenceTrigger: ConfigSequenceTrigger;
+  sequenceTriggerIndex: number;
+};
+
+type EventAutomation = EventAutomationEntity | EventAutomationSequence;
+
+const isEventAutomationSequence = (automation: EventAutomation): automation is EventAutomationSequence => {
+  return !!(automation as EventAutomationSequence).sequenceTrigger;
+};
+
 type EntityId = string;
 type SceneId = string;
 
-type EventAutomations = {
-  [key: EntityId]: EventAutomation[];
-};
+type EventAutomations = Record<EntityId, EventAutomation[]>;
+
+interface SequenceAutomationData {
+  activeIndex: number;
+  lastTriggerTimeMs: number | null;
+}
+
+// automation key -> sequence automation data
+type SequenceAutomations = Record<string, SequenceAutomationData>;
 
 // Internal time based automations
 type TimeAutomation = BaseAutomation & {
@@ -292,6 +314,9 @@ class AutomationsExtension {
   private scenes: ConfigScenes = {};
   private readonly eventAutomations: EventAutomations = {};
   private timeAutomations: TimeAutomations = {};
+  private readonly sequenceAutomations: SequenceAutomations = {};
+  // sequenceAutomationKey_triggerIndex_sequenceTriggerIndex -> timeout
+  private readonly sequenceTriggerForTimeouts: Record<string, NodeJS.Timeout> = {};
   private readonly triggerForTimeouts: Record<string, NodeJS.Timeout>;
   private readonly turnOffAfterTimeouts: Record<string, NodeJS.Timeout>;
   private midnightTimeout: NodeJS.Timeout | undefined;
@@ -402,12 +427,16 @@ class AutomationsExtension {
       }
       // Check triggers
       for (const trigger of triggers) {
-        if (!trigger.time && !trigger.entity) {
-          this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity not defined`);
+        if (!trigger.time && !trigger.entity && !trigger.sequence) {
+          this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity or time or sequence not defined`);
           return;
         }
-        if (!trigger.time && !this.zigbee.resolveEntity(trigger.entity)) {
+        if (!trigger.time && !trigger.sequence && !this.zigbee.resolveEntity(trigger.entity)) {
           this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity #${trigger.entity}# not found`);
+          return;
+        }
+        if (trigger.sequence && !trigger.sequence.length) {
+          this.logger.error(`[Automations] Config validation error for [${key}]: sequence is empty`);
           return;
         }
       }
@@ -432,97 +461,153 @@ class AutomationsExtension {
       }
       // Check conditions
       for (const condition of conditions) {
-        if (
-          !(condition as ConfigEntityCondition).entity &&
-          !(condition as ConfigTimeCondition).after &&
-          !(condition as ConfigTimeCondition).before &&
-          !(condition as ConfigTimeCondition).between &&
-          !(condition as ConfigTimeCondition).weekday
-        ) {
+        if (!isConfigEntityCondition(condition) && !isConfigTimeCondition(condition)) {
           this.logger.error(`[Automations] Config validation error for [${key}]: condition unknown`);
           return;
         }
-        if ((condition as ConfigEntityCondition).entity && !this.zigbee.resolveEntity((condition as ConfigEntityCondition).entity)) {
-          this.logger.error(`[Automations] Config validation error for [${key}]: condition entity #${(condition as ConfigEntityCondition).entity}# not found`);
+        if (isConfigEntityCondition(condition) && !this.zigbee.resolveEntity(condition.entity)) {
+          this.logger.error(`[Automations] Config validation error for [${key}]: condition entity #${condition.entity}# not found`);
           return;
         }
       }
 
-      for (const trigger of triggers) {
-        if (trigger.time !== undefined) {
-          const timeTrigger = trigger as ConfigTimeTrigger;
-          this.logger.info(`[Automations] Registering time automation [${key}] trigger: ${timeTrigger.time}`);
-          const suncalcs = Object.values(ConfigSunCalc);
-          if (suncalcs.includes(timeTrigger.time as ConfigSunCalc)) {
-            if (!timeTrigger.latitude || !timeTrigger.longitude) {
-              this.logger.error(`[Automations] Config validation error for [${key}]: latitude and longitude are mandatory for ${trigger.time}`);
-              return;
-            }
-            const suncalc = new SunCalc();
-            const times = suncalc.getTimes(new Date(), timeTrigger.latitude, timeTrigger.longitude, timeTrigger.elevation ? timeTrigger.elevation : 0) as object;
-            this.logger.debug(
-              `[Automations] Sunrise at ${times[ConfigSunCalc.SUNRISE].toLocaleTimeString()} sunset at ${times[ConfigSunCalc.SUNSET].toLocaleTimeString()} for latitude:${
-                timeTrigger.latitude
-              } longitude:${timeTrigger.longitude} elevation:${timeTrigger.elevation ? timeTrigger.elevation : 0}`,
-            );
-            this.log.debug(
-              `[Automations] For latitude:${timeTrigger.latitude} longitude:${timeTrigger.longitude} elevation:${timeTrigger.elevation ? timeTrigger.elevation : 0} suncalc are:\n`,
-              times,
-            );
-            const options = {
-              hour12: false,
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit',
-            };
-            const time = times[trigger.time].toLocaleTimeString('en-GB', options);
-            this.log.debug(`[Automations] Registering time automation [${key}] trigger: ${time}`);
-            if (!this.timeAutomations[time]) this.timeAutomations[time] = [];
-            this.timeAutomations[time].push({
-              name: key,
-              execute_once: configAutomation.execute_once,
-              trigger: timeTrigger,
-              action: actions,
-              condition: conditions,
-            });
-          } else if (this.matchTimeString(timeTrigger.time)) {
-            if (!this.timeAutomations[timeTrigger.time]) this.timeAutomations[timeTrigger.time] = [];
-            this.timeAutomations[timeTrigger.time].push({
-              name: key,
-              execute_once: configAutomation.execute_once,
-              trigger: timeTrigger,
-              action: actions,
-              condition: conditions,
-            });
-          } else {
-            this.logger.error(`[Automations] Config validation error for [${key}]: time syntax error for ${trigger.time}`);
-            return;
-          }
+      for (let index = 0; index < triggers.length; index++) {
+        const trigger = triggers[index];
+        const automationData = { execute_once: configAutomation.execute_once, action: actions, condition: conditions };
+        if (trigger.time) {
+          this.parseTimeTrigger(trigger, key, automationData);
         }
-        if (trigger.entity !== undefined) {
-          const eventTrigger = trigger as ConfigEventTrigger;
-          if (!this.zigbee.resolveEntity(eventTrigger.entity)) {
-            this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity #${eventTrigger.entity}# not found`);
-            return;
-          }
-          this.logger.info(`[Automations] Registering event automation [${key}] trigger: entity #${eventTrigger.entity}#`);
-          const entities = toArray(eventTrigger.entity);
-          for (const entity of entities) {
-            if (!this.eventAutomations[entity]) {
-              this.eventAutomations[entity] = [];
-            }
-            this.eventAutomations[entity].push({
-              name: key,
-              execute_once: configAutomation.execute_once,
-              trigger: eventTrigger,
-              action: actions,
-              condition: conditions,
-            });
-          }
+        if (trigger.entity) {
+          this.parseEventTrigger(trigger, key, automationData);
         }
-      } // for (const trigger of triggers)
+        if (trigger.sequence) {
+          this.parseSequenceTrigger(trigger, key, index, automationData);
+        }
+      }
     });
     return true;
+  }
+
+  private parseTimeTrigger(
+    timeTrigger: ConfigTimeTrigger,
+    key: string,
+    automationData: { execute_once: ExecuteOnceType | undefined; action: ConfigAction[]; condition: ConfigCondition[] },
+  ): void {
+    this.logger.info(`[Automations] Registering time automation [${key}] trigger: ${timeTrigger.time}`);
+    const suncalcs = Object.values(ConfigSunCalc);
+    if (suncalcs.includes(timeTrigger.time as ConfigSunCalc)) {
+      if (!timeTrigger.latitude || !timeTrigger.longitude) {
+        this.logger.error(`[Automations] Config validation error for [${key}]: latitude and longitude are mandatory for ${timeTrigger.time}`);
+        return;
+      }
+      const suncalc = new SunCalc();
+      const times = suncalc.getTimes(new Date(), timeTrigger.latitude, timeTrigger.longitude, timeTrigger.elevation ? timeTrigger.elevation : 0) as object;
+      this.logger.debug(
+        `[Automations] Sunrise at ${times[ConfigSunCalc.SUNRISE].toLocaleTimeString()} sunset at ${times[ConfigSunCalc.SUNSET].toLocaleTimeString()} for latitude:${
+          timeTrigger.latitude
+        } longitude:${timeTrigger.longitude} elevation:${timeTrigger.elevation ? timeTrigger.elevation : 0}`,
+      );
+      this.log.debug(
+        `[Automations] For latitude:${timeTrigger.latitude} longitude:${timeTrigger.longitude} elevation:${timeTrigger.elevation ? timeTrigger.elevation : 0} suncalc are:\n`,
+        times,
+      );
+      const options = {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      } as const;
+      const time = times[timeTrigger.time].toLocaleTimeString('en-GB', options);
+      this.log.debug(`[Automations] Registering time automation [${key}] trigger: ${time}`);
+      if (!this.timeAutomations[time]) this.timeAutomations[time] = [];
+      this.timeAutomations[time].push({
+        name: key,
+        trigger: timeTrigger,
+        ...automationData,
+      });
+    } else if (this.matchTimeString(timeTrigger.time)) {
+      if (!this.timeAutomations[timeTrigger.time]) this.timeAutomations[timeTrigger.time] = [];
+      this.timeAutomations[timeTrigger.time].push({
+        name: key,
+        trigger: timeTrigger,
+        ...automationData,
+      });
+    } else {
+      this.logger.error(`[Automations] Config validation error for [${key}]: time syntax error for ${timeTrigger.time}`);
+      return;
+    }
+  }
+
+  private getSequenceDataKey(key: string, index: number): string {
+    return `seq-${key}-${index}`;
+  }
+
+  private addEmptySequenceAutomationData(automationKey: string, triggerIndex: number): void {
+    const sequenceDataKey = this.getSequenceDataKey(automationKey, triggerIndex);
+    if (!this.sequenceAutomations[sequenceDataKey]) {
+      this.sequenceAutomations[sequenceDataKey] = {
+        activeIndex: 0,
+        lastTriggerTimeMs: null,
+      };
+    }
+  }
+
+  private getSequenceAutomationData(automationKey: string, triggerIndex: number): SequenceAutomationData | undefined {
+    const sequenceDataKey = this.getSequenceDataKey(automationKey, triggerIndex);
+    return this.sequenceAutomations[sequenceDataKey];
+  }
+
+  private addEventAutomation(entities: EntityId[], automation: EventAutomation): void {
+    for (const entity of entities) {
+      if (!this.eventAutomations[entity]) {
+        this.eventAutomations[entity] = [];
+      }
+      this.eventAutomations[entity].push({ ...automation });
+    }
+  }
+
+  private parseEventTrigger(
+    eventTrigger: ConfigEventTrigger,
+    key: string,
+    automationData: { execute_once: ExecuteOnceType | undefined; action: ConfigAction[]; condition: ConfigCondition[] },
+  ): void {
+    if (!this.zigbee.resolveEntity(eventTrigger.entity)) {
+      this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity #${eventTrigger.entity}# not found`);
+      return;
+    }
+    this.logger.info(`[Automations] Registering event automation [${key}] trigger: entity #${eventTrigger.entity}#`);
+    this.addEventAutomation(toArray(eventTrigger.entity), {
+      name: key,
+      trigger: eventTrigger,
+      ...automationData,
+    });
+  }
+
+  private parseSequenceTrigger(
+    sequenceTrigger: ConfigSequenceTrigger,
+    key: string,
+    triggerIndex: number,
+    automationData: { action: ConfigAction[]; condition: ConfigCondition[] },
+  ): void {
+    this.addEmptySequenceAutomationData(key, triggerIndex);
+
+    for (let sequenceTriggerIndex = 0; sequenceTriggerIndex < sequenceTrigger.sequence.length; sequenceTriggerIndex++) {
+      const eventTrigger = sequenceTrigger.sequence[sequenceTriggerIndex];
+      if (!this.zigbee.resolveEntity(eventTrigger.entity)) {
+        this.logger.error(`[Automations] Config validation error for [${key}]: trigger entity #${eventTrigger.entity}# not found`);
+        return;
+      }
+      this.logger.info(`[Automations] Registering event automation [${key}] trigger: entity #${eventTrigger.entity}#`);
+      this.addEventAutomation(toArray(eventTrigger.entity), {
+        name: key,
+        trigger: eventTrigger,
+        triggerIndex,
+        sequenceTrigger,
+        sequenceTriggerIndex,
+        ...automationData,
+        execute_once: false,
+      });
+    }
   }
 
   /**
@@ -614,13 +699,15 @@ class AutomationsExtension {
     if (timeEvent !== undefined) {
       if (timeEvent.getTime() > now.getTime()) {
         this.logger.debug(`[Automations] Set timeout at ${timeEvent.toLocaleString()} for [${automation.name}]`);
-        const timeout = setTimeout(() => {
-          delete this.triggerForTimeouts[automation.name];
-          this.logger.debug(`[Automations] Timeout for [${automation.name}]`);
-          this.runActionsWithConditions(automation, automation.condition, automation.action);
-        }, timeEvent.getTime() - now.getTime());
-        timeout.unref();
-        this.triggerForTimeouts[automation.name] = timeout;
+        this.startUnrefTimeout(
+          this.triggerForTimeouts,
+          automation.name,
+          () => {
+            this.logger.debug(`[Automations] Timeout for [${automation.name}]`);
+            this.runActionsWithConditions(automation, automation.condition, automation.action);
+          },
+          timeEvent.getTime() - now.getTime(),
+        );
       } else {
         this.logger.debug(`[Automations] Timeout at ${timeEvent.toLocaleString()} is passed for [${automation.name}]`);
       }
@@ -966,27 +1053,30 @@ class AutomationsExtension {
   private startActionTurnOffTimeout(automation: BaseAutomation, action: ConfigAction): void {
     this.stopActionTurnOffTimeout(automation, action);
     this.logger.debug(`[Automations] Start ${action.turn_off_after} seconds turn_off_after timeout for automation [${automation.name}]`);
-    const timeout = setTimeout(() => {
-      delete this.turnOffAfterTimeouts[automation.name + action.entity];
-      // this.logger.debug(`[Automations] Turn_off_after timeout for automation [${automation.name}]`);
-      const entity = this.zigbee.resolveEntity(action.entity);
-      if (!entity) {
-        this.logger.error(`[Automations] Entity #${action.entity}# not found so ignoring this action`);
-        this.stopActionTurnOffTimeout(automation, action);
-        return;
-      }
-      const data = action.payload_off ?? { state: ConfigState.OFF };
-      if (action.logger === 'info')
-        this.logger.info(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
-      else if (action.logger === 'warning')
-        this.logger.warning(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
-      else if (action.logger === 'error')
-        this.logger.error(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
-      else this.logger.debug(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
-      this.mqtt.onMessage(`${this.mqttBaseTopic}/${entity.name}/set`, Buffer.from(this.payloadStringify(data)));
-    }, action.turn_off_after! * 1000);
-    timeout.unref();
-    this.turnOffAfterTimeouts[automation.name + action.entity] = timeout;
+
+    this.startUnrefTimeout(
+      this.turnOffAfterTimeouts,
+      automation.name + action.entity,
+      () => {
+        // this.logger.debug(`[Automations] Turn_off_after timeout for automation [${automation.name}]`);
+        const entity = this.zigbee.resolveEntity(action.entity);
+        if (!entity) {
+          this.logger.error(`[Automations] Entity #${action.entity}# not found so ignoring this action`);
+          this.stopActionTurnOffTimeout(automation, action);
+          return;
+        }
+        const data = action.payload_off ?? { state: ConfigState.OFF };
+        if (action.logger === 'info')
+          this.logger.info(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
+        else if (action.logger === 'warning')
+          this.logger.warning(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
+        else if (action.logger === 'error')
+          this.logger.error(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
+        else this.logger.debug(`[Automations] Turn_off_after timeout for automation [${automation.name}] send ${this.payloadStringify(data)} to entity #${action.entity}# `);
+        this.mqtt.onMessage(`${this.mqttBaseTopic}/${entity.name}/set`, Buffer.from(this.payloadStringify(data)));
+      },
+      action.turn_off_after! * 1000,
+    );
   }
 
   private runActionsWithConditions(automation: BaseAutomation, conditions: ConfigCondition[], actions: ConfigAction[]): void {
@@ -997,6 +1087,56 @@ class AutomationsExtension {
       }
     }
     this.runActions(automation, actions);
+  }
+
+  private getSequenceTriggerForTimeoutKey({ name, triggerIndex, sequenceTriggerIndex }: EventAutomationSequence): string {
+    return `${name}_${triggerIndex}_${sequenceTriggerIndex}`;
+  }
+
+  private getSequenceTriggerForTimeoutId(automation: EventAutomationSequence): NodeJS.Timeout | undefined {
+    const key = this.getSequenceTriggerForTimeoutKey(automation);
+    return this.sequenceTriggerForTimeouts[key];
+  }
+
+  private stopSequenceTriggerForTimeout(automation: EventAutomationSequence): void {
+    const key = this.getSequenceTriggerForTimeoutKey(automation);
+    const timeout = this.sequenceTriggerForTimeouts[key];
+    if (timeout) {
+      this.logger.debug(`[Automations] Stop sequence trigger-for timeout for automation [${key}]`);
+      clearTimeout(timeout);
+      delete this.sequenceTriggerForTimeouts[key];
+    }
+  }
+
+  private startUnrefTimeout(timeouts: Record<string, NodeJS.Timeout>, key: string, callback: () => void, delay: number): NodeJS.Timeout {
+    const timeout = setTimeout(() => {
+      delete timeouts[key];
+      callback();
+    }, delay);
+
+    timeout.unref();
+    timeouts[key] = timeout;
+
+    return timeout;
+  }
+
+  private startSequenceTriggerForTimeout(automation: EventAutomationSequence): void {
+    const key = this.getSequenceTriggerForTimeoutKey(automation);
+    if (!automation.trigger.for) {
+      this.logger.error(`[Automations] Sequence trigger-for timeout error for automation [${key}]`);
+      return;
+    }
+
+    this.logger.debug(`[Automations] Start ${automation.trigger.for} seconds sequence trigger-for timeout for automation [${key}]`);
+    this.startUnrefTimeout(
+      this.sequenceTriggerForTimeouts,
+      key,
+      () => {
+        this.logger.debug(`[Automations] Sequence trigger-for timeout for automation [${key}]`);
+        this.runSequenceActionsWithConditions(automation, Date.now());
+      },
+      automation.trigger.for * 1000,
+    );
   }
 
   // Stop the trigger_for timeout
@@ -1011,28 +1151,98 @@ class AutomationsExtension {
   }
 
   // Start the trigger_for timeout
-  private startTriggerForTimeout(automation: EventAutomation): void {
+  private startTriggerForTimeout(automation: EventAutomationEntity): void {
     if (automation.trigger.for === undefined || automation.trigger.for === 0) {
       this.logger.error(`[Automations] Start ${automation.trigger.for} seconds trigger-for timeout error for automation [${automation.name}]`);
       return;
     }
     this.logger.debug(`[Automations] Start ${automation.trigger.for} seconds trigger-for timeout for automation [${automation.name}]`);
-    const timeout = setTimeout(() => {
-      delete this.triggerForTimeouts[automation.name];
-      this.logger.debug(`[Automations] Trigger-for timeout for automation [${automation.name}]`);
+    this.startUnrefTimeout(
+      this.triggerForTimeouts,
+      automation.name,
+      () => {
+        this.logger.debug(`[Automations] Trigger-for timeout for automation [${automation.name}]`);
+        this.runActionsWithConditions(automation, automation.condition, automation.action);
+      },
+      automation.trigger.for * 1000,
+    );
+  }
+
+  private runSequenceAutomationIfMatches(automation: EventAutomationSequence, update: StateChangeUpdate, from: StateChangeFrom, to: StateChangeTo): void {
+    const now = Date.now();
+
+    const sequenceData = this.getSequenceAutomationData(automation.name, automation.triggerIndex);
+    if (!sequenceData) {
+      this.logger.error(`[Automations] Sequence automation [${automation.name}] trigger index [${automation.triggerIndex}] data not found`);
+      return;
+    }
+
+    if (sequenceData.activeIndex !== automation.sequenceTriggerIndex) {
+      return;
+    }
+
+    const delay = sequenceData.lastTriggerTimeMs ? now - sequenceData.lastTriggerTimeMs : -1;
+    if (delay > automation.sequenceTrigger.max_delay) {
+      this.logger.info(`[Automations] Sequence automation [${automation.name}] delay is greater than max_delay: ${delay} > ${automation.sequenceTrigger.max_delay}`);
+      sequenceData.activeIndex = 0;
+      sequenceData.lastTriggerTimeMs = null;
+      this.stopSequenceTriggerForTimeout(automation);
+      return;
+    }
+
+    const checkRes = this.checkTrigger(automation, automation.trigger, update, from, to);
+    if (checkRes === null) {
+      return;
+    }
+
+    if (!checkRes) {
+      this.stopSequenceTriggerForTimeout(automation);
+      return;
+    }
+
+    if (this.getSequenceTriggerForTimeoutId(automation)) {
+      this.logger.debug(`[Automations] Waiting sequence trigger-for timeout for automation [${automation.name}]`);
+      return;
+    }
+
+    this.logger.debug(`[Automations] Start sequence automation [${automation.name}]`);
+    if (automation.trigger.for) {
+      this.startSequenceTriggerForTimeout(automation);
+      return;
+    }
+
+    this.runSequenceActionsWithConditions(automation, now);
+  }
+
+  private runSequenceActionsWithConditions(automation: EventAutomationSequence, now: number): void {
+    const sequenceData = this.getSequenceAutomationData(automation.name, automation.triggerIndex);
+    if (!sequenceData) {
+      this.logger.error(`[Automations] Run Sequence automation [${automation.name}] trigger index [${automation.triggerIndex}] data not found`);
+      return;
+    }
+
+    sequenceData.activeIndex = (sequenceData.activeIndex + 1) % automation.sequenceTrigger.sequence.length;
+    if (sequenceData.activeIndex === 0) {
+      sequenceData.lastTriggerTimeMs = null;
       this.runActionsWithConditions(automation, automation.condition, automation.action);
-    }, automation.trigger.for * 1000);
-    timeout.unref();
-    this.triggerForTimeouts[automation.name] = timeout;
+    } else {
+      sequenceData.lastTriggerTimeMs = now;
+    }
   }
 
   private runAutomationIfMatches(automation: EventAutomation, update: StateChangeUpdate, from: StateChangeFrom, to: StateChangeTo): void {
-    const triggerResult = this.checkTrigger(automation, automation.trigger, update, from, to);
-    if (triggerResult === false) {
-      this.stopTriggerForTimeout(automation);
+    if (isEventAutomationSequence(automation)) {
+      this.runSequenceAutomationIfMatches(automation, update, from, to);
       return;
     }
+
+    const triggerResult = this.checkTrigger(automation, automation.trigger, update, from, to);
     if (triggerResult === null) {
+      return;
+    }
+
+    if (!triggerResult) {
+      this.stopTriggerForTimeout(automation);
       return;
     }
     const timeout = this.triggerForTimeouts[automation.name];
@@ -1054,7 +1264,16 @@ class AutomationsExtension {
     if (!automations) {
       return;
     }
-    for (const automation of automations) {
+
+    // Last triggers in a sequence must be processed first
+    const sortedAutomations = automations.sort((a, b) => {
+      if (isEventAutomationSequence(a) && isEventAutomationSequence(b)) {
+        return b.sequenceTriggerIndex - a.sequenceTriggerIndex;
+      }
+      return 0;
+    });
+
+    for (const automation of sortedAutomations) {
       this.runAutomationIfMatches(automation, update, from, to);
     }
   }
