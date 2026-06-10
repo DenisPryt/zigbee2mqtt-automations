@@ -8,7 +8,7 @@ Automations and scenes extension for zigbee2mqtt (www.zigbee2mqtt.io)
 
 - Support multiple event based triggers;
 - Support time automations (execution at specified time);
-- Support suncalc automations like sunset, sunrise and others at a specified location and altitude;
+- Support suncalc automations like sunset, sunrise and others at a specified location and altitude, with optional offset;
 - Provides comprehensive logging within the zigbee2mqtt logging system for triggers, conditions and actions;
 - Performs thorough validation of the automation configuration file for errors (errors are logged at loading time and the erroneous automation is discarded);
 - Error messages and execution notifications can be displayed as pop-up messages in frontend.
@@ -88,6 +88,7 @@ Publish topic: **"zigbee2mqtt-scenes/Name"** and raw message: **"execute"** wher
     latitude?:            ## Numeric latitude (mandatory for suncalc triggers) Use https://www.latlong.net/ to get latidute and longitude based on your adress
     longitude?:           ## Numeric longitude (mandatory for suncalc triggers) Use https://www.latlong.net/ to get latidute and longitude based on your adress
     elevation?:           ## Numeric elevation in meters for precise suncalc results Default: 0
+    offset?:              ## Duration string [-]hh:mm:ss for suncalc triggers only (e.g. -00:30:00 = 30 min before, 01:00:00 = 1 hour after)
     ---------------------- event trigger ------------------------------
     entity:               ## Name of the entity (device or group friendly name) to evaluate
     for?:                 ## Number: duration in seconds for the specific attribute to remain in the triggered state
@@ -137,6 +138,30 @@ Turn off at 23:
 Sunset:
   trigger:
     time: sunset
+    latitude: 48.858372
+    longitude: 2.294481
+    elevation: 330
+```
+
+### The automation is run at sunset with an offset (30 minutes before sunset)
+
+```yaml
+Lights on before sunset:
+  trigger:
+    time: sunset
+    offset: -00:30:00
+    latitude: 48.858372
+    longitude: 2.294481
+    elevation: 330
+```
+
+### The automation is run at sunrise with an offset (1 hour after sunrise)
+
+```yaml
+Lights off after sunrise:
+  trigger:
+    time: sunrise
+    offset: 01:00:00
     latitude: 48.858372
     longitude: 2.294481
     elevation: 330
@@ -275,6 +300,21 @@ Sunset:
   action:
     - entity: Moes RGB CCT led controller
       payload: { state: ON }
+    - entity: Is night
+      payload: { state: ON }
+```
+
+```yaml
+Sunset with offset:
+  trigger:
+    time: sunset
+    offset: -00:45:00
+    latitude: 48.858372
+    longitude: 2.294481
+    elevation: 330
+  action:
+    - entity: Moes RGB CCT led controller
+      payload: { state: ON, brightness: 128 }
     - entity: Is night
       payload: { state: ON }
 ```

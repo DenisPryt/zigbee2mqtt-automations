@@ -120,6 +120,7 @@ interface ConfigTimeTrigger {
   latitude?: number;
   longitude?: number;
   elevation?: number;
+  offset?: TimeStringType; // duration hh:mm:ss to add to suncalc time (prefix - for before)
 }
 
 interface ConfigEventTriggerBase {
@@ -488,20 +489,72 @@ class AutomationsExtension {
     return true;
   }
 
+  private formatTimeString(date: Date): TimeStringType {
+    const options = {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    } as const;
+    return date.toLocaleTimeString('en-GB', options);
+  }
+
+  /**
+   * Parse an offset duration string and return milliseconds or undefined if error.
+   * Format: [-]hh:mm:ss (e.g. -00:30:00, 01:15:00)
+   *
+   * @param offsetString
+   */
+  private parseOffsetString(offsetString: TimeStringType): number | undefined {
+    const match = offsetString.match(/^(-)?(\d{1,2}):(\d{2}):(\d{2})$/);
+    if (!match) return undefined;
+
+    const hours = parseInt(match[2], 10);
+    const minutes = parseInt(match[3], 10);
+    const seconds = parseInt(match[4], 10);
+    if (minutes > 59 || seconds > 59) return undefined;
+
+    const sign = match[1] === '-' ? -1 : 1;
+    return sign * (hours * 3600 + minutes * 60 + seconds) * 1000;
+  }
+
+  private getSunCalcTriggerTime(timeTrigger: ConfigTimeTrigger, date: Date = new Date()): TimeStringType | undefined {
+    if (!timeTrigger.latitude || !timeTrigger.longitude) return undefined;
+
+    const suncalc = new SunCalc();
+    const times = suncalc.getTimes(date, timeTrigger.latitude, timeTrigger.longitude, timeTrigger.elevation ?? 0) as Record<string, Date>;
+    const sunTime = times[timeTrigger.time];
+    if (!sunTime) return undefined;
+
+    const adjustedTime = new Date(sunTime.getTime());
+    if (timeTrigger.offset !== undefined) {
+      const offsetMs = this.parseOffsetString(timeTrigger.offset);
+      if (offsetMs === undefined) return undefined;
+      adjustedTime.setTime(adjustedTime.getTime() + offsetMs);
+    }
+
+    return this.formatTimeString(adjustedTime);
+  }
+
   private parseTimeTrigger(
     timeTrigger: ConfigTimeTrigger,
     key: string,
     automationData: { execute_once: ExecuteOnceType | undefined; action: ConfigAction[]; condition: ConfigCondition[] },
   ): void {
-    this.logger.info(`[Automations] Registering time automation [${key}] trigger: ${timeTrigger.time}`);
+    const offsetInfo = timeTrigger.offset !== undefined ? ` (offset: ${timeTrigger.offset})` : '';
+    this.logger.info(`[Automations] Registering time automation [${key}] trigger: ${timeTrigger.time}${offsetInfo}`);
     const suncalcs = Object.values(ConfigSunCalc);
     if (suncalcs.includes(timeTrigger.time as ConfigSunCalc)) {
       if (!timeTrigger.latitude || !timeTrigger.longitude) {
         this.logger.error(`[Automations] Config validation error for [${key}]: latitude and longitude are mandatory for ${timeTrigger.time}`);
         return;
       }
+      if (timeTrigger.offset !== undefined && this.parseOffsetString(timeTrigger.offset) === undefined) {
+        this.logger.error(`[Automations] Config validation error for [${key}]: offset syntax error for ${timeTrigger.offset}`);
+        return;
+      }
       const suncalc = new SunCalc();
-      const times = suncalc.getTimes(new Date(), timeTrigger.latitude, timeTrigger.longitude, timeTrigger.elevation ? timeTrigger.elevation : 0) as object;
+      const times = suncalc.getTimes(new Date(), timeTrigger.latitude, timeTrigger.longitude, timeTrigger.elevation ? timeTrigger.elevation : 0) as Record<string, Date>;
       this.logger.debug(
         `[Automations] Sunrise at ${times[ConfigSunCalc.SUNRISE].toLocaleTimeString()} sunset at ${times[ConfigSunCalc.SUNSET].toLocaleTimeString()} for latitude:${
           timeTrigger.latitude
@@ -511,13 +564,11 @@ class AutomationsExtension {
         `[Automations] For latitude:${timeTrigger.latitude} longitude:${timeTrigger.longitude} elevation:${timeTrigger.elevation ? timeTrigger.elevation : 0} suncalc are:\n`,
         times,
       );
-      const options = {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      } as const;
-      const time = times[timeTrigger.time].toLocaleTimeString('en-GB', options);
+      const time = this.getSunCalcTriggerTime(timeTrigger);
+      if (!time) {
+        this.logger.error(`[Automations] Config validation error for [${key}]: unable to resolve suncalc time for ${timeTrigger.time}`);
+        return;
+      }
       this.log.debug(`[Automations] Registering time automation [${key}] trigger: ${time}`);
       if (!this.timeAutomations[time]) this.timeAutomations[time] = [];
       this.timeAutomations[time].push({
@@ -650,17 +701,8 @@ class AutomationsExtension {
           const timeAutomationArray = this.timeAutomations[key];
           timeAutomationArray.forEach((timeAutomation) => {
             if (suncalcs.includes(timeAutomation.trigger.time as ConfigSunCalc)) {
-              if (!timeAutomation.trigger.latitude || !timeAutomation.trigger.longitude) return;
-              const suncalc = new SunCalc();
-              const times = suncalc.getTimes(new Date(), timeAutomation.trigger.latitude, timeAutomation.trigger.longitude, timeAutomation.trigger.elevation ?? 0);
-              // this.log.info(`Key:[${key}] For latitude:${timeAutomation.trigger.latitude} longitude:${timeAutomation.trigger.longitude} elevation:${timeAutomation.trigger.elevation ?? 0} suncalcs are:\n`, times);
-              const options = {
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-              };
-              const time = times[timeAutomation.trigger.time].toLocaleTimeString('en-GB', options);
+              const time = this.getSunCalcTriggerTime(timeAutomation.trigger);
+              if (!time) return;
               // this.log.info(`Registering suncalc time automation at time [${time}] for:`, timeAutomation);
               this.logger.info(`[Automations] Registering suncalc time automation at time [${time}] for: ${this.stringify(timeAutomation)}`);
               if (!newTimeAutomations[time]) newTimeAutomations[time] = [];
