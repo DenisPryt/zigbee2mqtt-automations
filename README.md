@@ -21,6 +21,13 @@ Automations and scenes extension for zigbee2mqtt (www.zigbee2mqtt.io)
 - A scene can be executed by an automation.
 - A scene can be manually executed by publishing a message to mqtt.
 
+## Variables
+
+- Variables are shared key-value pairs that persist across automation runs via MQTT retained messages.
+- A variable can be written from an automation action.
+- A variable can be read in automation conditions (equal, not_equal, above, below).
+- Variables can be read and written externally via MQTT (e.g. from Node-RED, Home Assistant, mosquitto_pub).
+
 If you like this project and find it useful, please consider giving it a star on GitHub at https://github.com/Luligu/zigbee2mqtt-automations and sponsoring it.
 
 <a href="https://www.buymeacoffee.com/luligugithub">
@@ -74,7 +81,23 @@ Publish topic: **"zigbee2mqtt-automations/Name"** and a raw message: **"execute"
 
 # How to execute a scene publishing a command to mqtt
 
-Publish topic: **"zigbee2mqtt-scenes/Name"** and raw message: **"execute"** where "Name" is the name of your scene in scenes.yaml..
+Publish topic: **"zigbee2mqtt-scenes/Name"** and raw message: **"execute"** where "Name" is the name of your scene in scenes.yaml.
+
+# How to set and delete a variable via mqtt
+
+Set a variable: publish topic **"zigbee2mqtt-variables/Name"** with any value and `retain: true`. The variable name must not contain `/`.
+
+Delete a variable: publish topic **"zigbee2mqtt-variables/Name"** with an empty payload and `retain: true`.
+
+```bash
+# Set
+mosquitto_pub -t "zigbee2mqtt-variables/mode" -m "night" -r
+
+# Delete
+mosquitto_pub -t "zigbee2mqtt-variables/mode" -m "" -r
+```
+
+Values are automatically parsed: `"true"`/`"false"` become boolean, numeric strings become numbers, everything else stays a string.
 
 # Config file automations.yaml:
 
@@ -120,6 +143,16 @@ Publish topic: **"zigbee2mqtt-scenes/Name"** and raw message: **"execute"** wher
     logger?:              ## Values: debug info warning error. Default: debug. The action will be logged on z2m logger with the specified logging level
     turn_off_after?:      ## Number: seconds to wait before turning off entity. Will send a turn_off to the entity.
     payload_off?:         ## Values: any supported attributes in an object. Will use payload_off instead of { state: "OFF" }.
+    ---------------------- variable action ----------------------------
+    variable:             ## Name of the variable to write (must not contain '/')
+    value:                ## Value to write: string, number or boolean
+  condition?:
+    ---------------------- variable condition -------------------------
+    variable:             ## Name of the variable to read (must not contain '/')
+    equal?:               ## Value of the variable to evaluate with =
+    not_equal?:           ## Value of the variable to evaluate with !=
+    above?:               ## Numeric value of the variable to evaluate with >
+    below?:               ## Numeric value of the variable to evaluate with <
 ```
 
 # Trigger examples:
@@ -423,6 +456,74 @@ Configure daily:
     - entity: Bathroom Leds
       payload: { switch_type: "momentary" }
       logger: info
+```
+
+# Variable examples
+
+### Set a variable from an action
+
+```yaml
+Set night mode:
+  trigger:
+    entity: Hallway button
+    action: single
+  action:
+    - variable: mode
+      value: "night"
+```
+
+### Read a variable in a condition
+
+```yaml
+Lights on motion (only at night):
+  trigger:
+    entity: Motion sensor
+    attribute: occupancy
+    equal: true
+  condition:
+    - variable: mode
+      equal: "night"
+  action:
+    - entity: Living room light
+      payload: turn_on
+```
+
+### Combine variable write and entity action
+
+```yaml
+Goodnight:
+  trigger:
+    entity: Bedroom button
+    action: double
+  action:
+    - variable: mode
+      value: "night"
+    - entity: All lights
+      payload: turn_off
+```
+
+### Use numeric variable with above/below
+
+```yaml
+High CO2:
+  trigger:
+    entity: CO2 sensor
+    attribute: co2
+    above: 1000
+  action:
+    - variable: co2_alert
+      value: 1
+    - entity: Ventilation
+      payload: turn_on
+
+Reset CO2 alert:
+  trigger:
+    entity: CO2 sensor
+    attribute: co2
+    below: 800
+  action:
+    - variable: co2_alert
+      value: 0
 ```
 
 # Config file scenes.yaml:

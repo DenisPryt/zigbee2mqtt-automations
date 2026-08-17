@@ -83,6 +83,9 @@ const isConfigTimeCondition = (condition) => {
         !!condition.between ||
         !!condition.weekday);
 };
+const isConfigVariableCondition = (condition) => {
+    return !!condition.variable;
+};
 const isEventAutomationSequence = (automation) => {
     return !!automation.sequenceTrigger;
 };
@@ -114,8 +117,10 @@ class AutomationsExtension {
     mqttBaseTopic;
     automationsTopic;
     scenesTopic;
+    variablesTopic;
     automationsTopicRegex;
     scenesTopicRegex;
+    variablesTopicRegex;
     scenes = {};
     eventAutomations = {};
     timeAutomations = {};
@@ -126,6 +131,7 @@ class AutomationsExtension {
     turnOffAfterTimeouts;
     midnightTimeout;
     log;
+    variables = {};
     constructor(zigbee, mqtt, state, publishEntityState, eventBus, enableDisableExtension, restartCallback, addExtension, settings, logger) {
         this.zigbee = zigbee;
         this.mqtt = mqtt;
@@ -143,10 +149,13 @@ class AutomationsExtension {
         this.turnOffAfterTimeouts = {};
         this.automationsTopic = 'zigbee2mqtt-automations';
         this.scenesTopic = 'zigbee2mqtt-scenes';
+        this.variablesTopic = 'zigbee2mqtt-variables';
         // eslint-disable-next-line no-useless-escape
         this.automationsTopicRegex = new RegExp(`^${this.automationsTopic}\/(.*)`);
         // eslint-disable-next-line no-useless-escape
         this.scenesTopicRegex = new RegExp(`^${this.scenesTopic}\/(.*)`);
+        // eslint-disable-next-line no-useless-escape
+        this.variablesTopicRegex = new RegExp(`^${this.variablesTopic}\/(.+)`);
         this.logger.info(`[Automations] Loading automation.js`);
         if (!this.parseConfig())
             return;
@@ -240,8 +249,8 @@ class AutomationsExtension {
             }
             // Check actions
             for (const action of actions) {
-                if (!action.entity && !action.scene) {
-                    this.logger.error(`[Automations] Config validation error for [${key}]: action entity or action scene not defined`);
+                if (!action.entity && !action.scene && !action.variable) {
+                    this.logger.error(`[Automations] Config validation error for [${key}]: action entity, scene or variable not defined`);
                     return;
                 }
                 if (action.entity && !this.zigbee.resolveEntity(action.entity)) {
@@ -256,15 +265,27 @@ class AutomationsExtension {
                     this.logger.error(`[Automations] Config validation error for [${key}]: action scene #${action.scene}# not found`);
                     return;
                 }
+                if (action.variable !== undefined && action.value === undefined) {
+                    this.logger.error(`[Automations] Config validation error for [${key}]: action variable #${action.variable}# value not defined`);
+                    return;
+                }
+                if (action.variable !== undefined && action.variable.includes('/')) {
+                    this.logger.error(`[Automations] Config validation error for [${key}]: action variable #${action.variable}# name must not contain '/'`);
+                    return;
+                }
             }
             // Check conditions
             for (const condition of conditions) {
-                if (!isConfigEntityCondition(condition) && !isConfigTimeCondition(condition)) {
+                if (!isConfigEntityCondition(condition) && !isConfigTimeCondition(condition) && !isConfigVariableCondition(condition)) {
                     this.logger.error(`[Automations] Config validation error for [${key}]: condition unknown`);
                     return;
                 }
                 if (isConfigEntityCondition(condition) && !this.zigbee.resolveEntity(condition.entity)) {
                     this.logger.error(`[Automations] Config validation error for [${key}]: condition entity #${condition.entity}# not found`);
+                    return;
+                }
+                if (isConfigVariableCondition(condition) && condition.variable.includes('/')) {
+                    this.logger.error(`[Automations] Config validation error for [${key}]: condition variable #${condition.variable}# name must not contain '/'`);
                     return;
                 }
             }
@@ -633,13 +654,49 @@ class AutomationsExtension {
     checkCondition(automation, condition) {
         let timeResult = true;
         let eventResult = true;
+        let variableResult = true;
         if (isConfigTimeCondition(condition)) {
             timeResult = this.checkTimeCondition(automation, condition);
         }
         if (isConfigEntityCondition(condition)) {
             eventResult = this.checkEntityCondition(automation, condition);
         }
-        return timeResult && eventResult;
+        if (isConfigVariableCondition(condition)) {
+            variableResult = this.checkVariableCondition(automation, condition);
+        }
+        return timeResult && eventResult && variableResult;
+    }
+    checkVariableCondition(automation, condition) {
+        const { variable } = condition;
+        const value = this.variables[variable];
+        if (value === undefined) {
+            this.logger.debug(`[Automations] Condition check [${automation.name}] variable #${variable}# is not set`);
+            return false;
+        }
+        if (condition.equal !== undefined && value !== condition.equal) {
+            this.logger.debug(`[Automations] Condition check [${automation.name}] variable condition is false for #${variable}# is '${value}' not equal '${condition.equal}'`);
+            return false;
+        }
+        if (condition.not_equal !== undefined && value === condition.not_equal) {
+            this.logger.debug(`[Automations] Condition check [${automation.name}] variable condition is false for #${variable}# is '${value}' not not_equal '${condition.not_equal}'`);
+            return false;
+        }
+        if (condition.above !== undefined) {
+            const numValue = Number(value);
+            if (isNaN(numValue) || numValue <= condition.above) {
+                this.logger.debug(`[Automations] Condition check [${automation.name}] variable condition is false for #${variable}# is '${value}' not above '${condition.above}'`);
+                return false;
+            }
+        }
+        if (condition.below !== undefined) {
+            const numValue = Number(value);
+            if (isNaN(numValue) || numValue >= condition.below) {
+                this.logger.debug(`[Automations] Condition check [${automation.name}] variable condition is false for #${variable}# is '${value}' not below '${condition.below}'`);
+                return false;
+            }
+        }
+        this.logger.debug(`[Automations] Condition check [${automation.name}] variable condition is true for #${variable}# is '${value}'`);
+        return true;
     }
     // Return false if condition is false
     checkTimeCondition(automation, condition) {
@@ -733,8 +790,35 @@ class AutomationsExtension {
         this.logger.debug(`[Automations] Condition check [${automation.name}] event condition is true for entity #${condition.entity}# attribute '${attribute}' is '${value}'`);
         return true;
     }
+    parseVariableValue(raw) {
+        if (raw === 'true')
+            return true;
+        if (raw === 'false')
+            return false;
+        const num = Number(raw);
+        if (!isNaN(num) && raw.trim() !== '')
+            return num;
+        return raw;
+    }
+    publishVariable(name, value) {
+        this.mqtt
+            .publish(name, String(value), { baseTopic: this.variablesTopic, skipReceive: false, clientOptions: { retain: true } })
+            .catch((error) => this.logger.error(`[Automations] Failed to publish variable #${name}#: ${error}`));
+    }
     runActions(automation, actions) {
         for (const action of actions) {
+            // Check if action is a variable write
+            if (action.variable !== undefined) {
+                if (action.variable.includes('/')) {
+                    this.logger.error(`[Automations] Run automation [${automation.name}] variable #${action.variable}# name must not contain '/'`);
+                    continue;
+                }
+                const value = action.value ?? '';
+                this.variables[action.variable] = value;
+                this.publishVariable(action.variable, value);
+                this.logger.debug(`[Automations] Run automation [${automation.name}] set variable #${action.variable}# = ${value}`);
+                continue;
+            }
             // Check if action is scene and run it
             if (action.scene && typeof action.scene === 'string') {
                 this.log.warning(`Executing scene: ${action.scene}`);
@@ -1021,7 +1105,24 @@ class AutomationsExtension {
     // Process MQTT messages private message for automations.
     // Publish: topic "zigbee2mqtt-automations/<automation_name>" with raw message "execute"
     // Publish: topic "zigbee2mqtt-scenes/<scene_name>" with raw message "execute"
+    // Publish: topic "zigbee2mqtt-automations/variables/<name>" with any value to set a variable
+    //          (empty payload deletes the variable)
     processMessage(message) {
+        this.logger.info(`[Automations] Processing MQTT message: ${message.topic} ${message.message}`);
+        const variablesMatch = message.topic.match(this.variablesTopicRegex);
+        if (variablesMatch) {
+            const name = variablesMatch[1];
+            const raw = message.message.trim();
+            if (raw === '') {
+                delete this.variables[name];
+                this.logger.info(`[Automations] Variable #${name}# deleted`);
+            }
+            else {
+                this.variables[name] = this.parseVariableValue(raw);
+                this.logger.info(`[Automations] Variable #${name}# = ${this.variables[name]}`);
+            }
+            return;
+        }
         const automationsMatch = message.topic.match(this.automationsTopicRegex);
         if (automationsMatch) {
             for (const automations of Object.values(this.eventAutomations)) {
@@ -1059,11 +1160,11 @@ class AutomationsExtension {
         this.eventBus.onStateChange(this, (data) => {
             this.findAndRun(data.entity.name, data.update, data.from, data.to);
         });
-        this.mqtt.subscribe(`${this.automationsTopic}/+`);
-        this.mqtt.subscribe(`${this.scenesTopic}/+`);
         this.eventBus.onMQTTMessage(this, (data) => {
             this.processMessage(data);
         });
+        await this.mqtt.unsubscribe(`${this.variablesTopic}/+`);
+        await Promise.all([this.mqtt.subscribe(`${this.automationsTopic}/+`), this.mqtt.subscribe(`${this.scenesTopic}/+`), this.mqtt.subscribe(`${this.variablesTopic}/+`)]);
     }
     async stop() {
         this.logger.debug(`[Automations] Extension unloading`);
@@ -1080,6 +1181,7 @@ class AutomationsExtension {
         clearTimeout(this.midnightTimeout);
         this.logger.debug(`[Automations] Removing listeners`);
         this.eventBus.removeListeners(this);
+        await Promise.all([this.mqtt.unsubscribe(`${this.automationsTopic}/+`), this.mqtt.unsubscribe(`${this.scenesTopic}/+`), this.mqtt.unsubscribe(`${this.variablesTopic}/+`)]);
         this.logger.debug(`[Automations] Extension unloaded`);
     }
     payloadStringify(payload) {
